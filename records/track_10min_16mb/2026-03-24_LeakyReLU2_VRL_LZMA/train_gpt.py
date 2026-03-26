@@ -903,115 +903,106 @@ def eval_val_sliding(
  tokens_per_byte = token_count.item() / byte_count.item()
  base_model.train()
  return val_loss, bits_per_token * tokens_per_byte
-class NgramCacheFast:
- def __init__(self, vocab_size: int, max_order: int = 7, hash_size: int = 65536):
+class HedgeMixer:
+ NUM_EXPERTS = 5
+ EX_NEURAL, EX_UNIGRAM, EX_BIGRAM, EX_TRIGRAM, EX_UNIFORM = range(5)
+ def __init__(self, vocab_size: int, eta: float = 0.1, hash_size: int = 65536, min_count: int = 2):
   self.V = vocab_size
-  self.max_order = max_order
+  self.eta = eta
   self.H = hash_size
+  self.min_count = min_count
+  self.log_w = np.zeros(self.NUM_EXPERTS, dtype=np.float64)
+  self.log_w[self.EX_NEURAL] = 2.0
   self.unigram = np.zeros(vocab_size, dtype=np.float64)
+  self.uni_total = 0
   self.bigram = np.zeros((vocab_size, vocab_size), dtype=np.float32)
   self.bigram_ctx = np.zeros(vocab_size, dtype=np.float32)
   self.trigram = np.zeros((hash_size, vocab_size), dtype=np.float32)
   self.trigram_ctx = np.zeros(hash_size, dtype=np.float32)
-  self.higher = [{} for _ in range(max_order - 2)]
-  self.higher_ctx = [{} for _ in range(max_order - 2)]
-  self.total = 0
-  self._PRIME = 1000003
  def _hash2(self, a: int, b: int) -> int:
   return ((a * 36313) ^ (b * 27191)) % self.H
- def _hash_n(self, ctx: tuple) -> int:
-  h = 0
-  for t in ctx:
-   h = (h * self._PRIME + t) % self.H
-  return h
- def update_batch(self, tokens: np.ndarray) -> None:
+ def _weights(self) -> np.ndarray:
+  shifted = self.log_w - self.log_w.max()
+  w = np.exp(shifted)
+  return w / w.sum()
+ def update_tokens(self, tokens: np.ndarray) -> None:
   n = len(tokens)
   if n == 0:
    return
-  self.total += n
   for t in tokens:
-   self.unigram[t] += 1
-  if n >= 2:
-   for i in range(1, n):
-    prev, cur = int(tokens[i-1]), int(tokens[i])
-    self.bigram[prev, cur] += 1
-    self.bigram_ctx[prev] += 1
-  if n >= 3:
-   for i in range(2, n):
-    h = self._hash2(int(tokens[i-2]), int(tokens[i-1]))
-    cur = int(tokens[i])
-    self.trigram[h, cur] += 1
-    self.trigram_ctx[h] += 1
-  for order_idx in range(len(self.higher)):
-   order = order_idx + 4
-   if n >= order:
-    for i in range(order - 1, n):
-     ctx = tuple(int(tokens[j]) for j in range(i - order + 1, i))
-     cur = int(tokens[i])
-     h = self._hash_n(ctx)
-     if h not in self.higher[order_idx]:
-      self.higher[order_idx][h] = {}
-      self.higher_ctx[order_idx][h] = 0
-     self.higher[order_idx][h][cur] = self.higher[order_idx][h].get(cur, 0) + 1
-     self.higher_ctx[order_idx][h] += 1
- def mix_batch(self, logits: Tensor, targets: Tensor, prev_tokens: Tensor,
-        all_tokens: np.ndarray, positions: list[int], device: torch.device) -> Tensor:
-  bsz = logits.shape[0]
-  neural_probs = torch.softmax(logits.float(), dim=-1)
-  entropy = -(neural_probs * torch.log(neural_probs + 1e-10)).sum(dim=-1)
-  max_ent = math.log(self.V)
-  confidence = 1.0 - torch.clamp(entropy / max_ent, 0, 1)
-  alpha = 0.3 * (1.0 - confidence)
-  ngram_probs = torch.zeros(bsz, self.V, device=device)
-  matched = torch.zeros(bsz, dtype=torch.bool, device=device)
+   self.unigram[int(t)] += 1
+  self.uni_total += n
+  for i in range(1, n):
+   prev, cur = int(tokens[i-1]), int(tokens[i])
+   self.bigram[prev, cur] += 1
+   self.bigram_ctx[prev] += 1
+  for i in range(2, n):
+   h = self._hash2(int(tokens[i-2]), int(tokens[i-1]))
+   cur = int(tokens[i])
+   self.trigram[h, cur] += 1
+   self.trigram_ctx[h] += 1
+ def score_and_update(self, neural_logits: Tensor, targets: Tensor,
+          all_tokens: np.ndarray, positions: list[int], device: torch.device) -> Tensor:
+  bsz = neural_logits.shape[0]
+  neural_probs = torch.softmax(neural_logits.float(), dim=-1).cpu().numpy()
+  target_np = targets.cpu().numpy()
+  w = self._weights()
+  nll_out = np.zeros(bsz, dtype=np.float64)
+  expert_losses = np.zeros(self.NUM_EXPERTS, dtype=np.float64)
+  expert_counts = np.zeros(self.NUM_EXPERTS, dtype=np.float64)
+  uniform_p = 1.0 / self.V
   for idx in range(bsz):
+   tgt = int(target_np[idx])
    pos = positions[idx]
-   found = False
-   for order_idx in range(len(self.higher) - 1, -1, -1):
-    order = order_idx + 4
-    if pos >= order:
-     ctx = tuple(int(all_tokens[j]) for j in range(pos - order + 1, pos))
-     h = self._hash_n(ctx)
-     if h in self.higher[order_idx] and self.higher_ctx[order_idx][h] >= 2:
-      dist = self.higher[order_idx][h]
-      total = self.higher_ctx[order_idx][h]
-      for tok, cnt in dist.items():
-       if tok < self.V:
-        ngram_probs[idx, tok] = cnt / total
-      found = True
-      break
-   if not found and pos >= 2:
-    h = self._hash2(int(all_tokens[pos-1]), int(all_tokens[pos]))
-    if self.trigram_ctx[h] >= 2:
-     row = self.trigram[h]
-     total = self.trigram_ctx[h]
-     ngram_probs[idx] = torch.from_numpy(row / total).to(device)
-     found = True
-   if not found and pos >= 1:
+   p_experts = np.zeros(self.NUM_EXPERTS, dtype=np.float64)
+   p_experts[self.EX_NEURAL] = max(float(neural_probs[idx, tgt]), 1e-12)
+   if self.uni_total >= self.min_count:
+    p_experts[self.EX_UNIGRAM] = max((self.unigram[tgt] + 0.01) / (self.uni_total + 0.01 * self.V), 1e-12)
+   else:
+    p_experts[self.EX_UNIGRAM] = uniform_p
+   if pos >= 1:
     prev = int(all_tokens[pos])
-    if self.bigram_ctx[prev] >= 2:
-     row = self.bigram[prev]
-     total = self.bigram_ctx[prev]
-     ngram_probs[idx] = torch.from_numpy((row / total).astype(np.float32)).to(device)
-     found = True
-   if not found and self.total > 0:
-    ngram_probs[idx] = torch.from_numpy((self.unigram / self.total).astype(np.float32)).to(device)
-    found = True
-   matched[idx] = found
-  mixed = (1.0 - alpha.unsqueeze(-1)) * neural_probs + alpha.unsqueeze(-1) * ngram_probs
-  nll = -torch.log(mixed[torch.arange(bsz, device=device), targets] + 1e-10)
-  return nll
-def eval_val_sliding_ngram(
+    ctx_count = self.bigram_ctx[prev]
+    if ctx_count >= self.min_count:
+     p_experts[self.EX_BIGRAM] = max((self.bigram[prev, tgt] + 0.01) / (ctx_count + 0.01 * self.V), 1e-12)
+    else:
+     p_experts[self.EX_BIGRAM] = p_experts[self.EX_UNIGRAM]
+   else:
+    p_experts[self.EX_BIGRAM] = p_experts[self.EX_UNIGRAM]
+   if pos >= 2:
+    h = self._hash2(int(all_tokens[pos-1]), int(all_tokens[pos]))
+    ctx_count = self.trigram_ctx[h]
+    if ctx_count >= self.min_count:
+     p_experts[self.EX_TRIGRAM] = max((self.trigram[h, tgt] + 0.01) / (ctx_count + 0.01 * self.V), 1e-12)
+    else:
+     p_experts[self.EX_TRIGRAM] = p_experts[self.EX_BIGRAM]
+   else:
+    p_experts[self.EX_TRIGRAM] = p_experts[self.EX_BIGRAM]
+   p_experts[self.EX_UNIFORM] = uniform_p
+   p_mix = np.dot(w, p_experts)
+   nll_out[idx] = -math.log(max(p_mix, 1e-15))
+   for e in range(self.NUM_EXPERTS):
+    loss_e = -math.log(max(p_experts[e], 1e-15))
+    expert_losses[e] += loss_e
+    expert_counts[e] += 1
+  for e in range(self.NUM_EXPERTS):
+   if expert_counts[e] > 0:
+    avg_loss = expert_losses[e] / expert_counts[e]
+    self.log_w[e] -= self.eta * avg_loss
+  max_lw = self.log_w.max()
+  self.log_w -= max_lw
+  return torch.from_numpy(nll_out).to(dtype=torch.float64, device=device)
+def eval_val_hedge_mixer(
  args, base_model: nn.Module, rank: int, world_size: int,
  device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
  has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
  stride: int, batch_seqs: int = 32, log0=print,
- ngram_order: int = 7,
+ hedge_eta: float = 0.1,
 ) -> tuple[float, float]:
  seq_len = args.train_seq_len
  total_tokens = val_tokens.numel() - 1
  vocab_size = args.vocab_size
- cache = NgramCacheFast(vocab_size, max_order=ngram_order)
+ mixer = HedgeMixer(vocab_size, eta=hedge_eta)
  window_starts = sorted([ws for ws in range(0, total_tokens, stride)
        if min(ws + seq_len, total_tokens) - ws >= 1])
  base_model.eval()
@@ -1049,10 +1040,10 @@ def eval_val_sliding_ngram(
     positions = [ws + t for t in range(s, wlen)]
     new_end = ws + wlen + 1
     if new_end > scored_up_to:
-     cache.update_batch(all_tokens[scored_up_to:new_end])
+     mixer.update_tokens(all_tokens[scored_up_to:new_end])
      scored_up_to = new_end
-    nll_batch = cache.mix_batch(scored_logits, scored_targets, scored_prev, all_tokens, positions, device)
-    loss_sum += nll_batch.to(torch.float64).sum()
+    nll_batch = mixer.score_and_update(scored_logits, scored_targets, all_tokens, positions, device)
+    loss_sum += nll_batch.sum()
     token_count += score_len
     tb = base_bytes_lut[scored_targets].to(torch.float64)
     tb += (has_leading_space_lut[scored_targets] & ~is_boundary_token_lut[scored_prev]).to(torch.float64)
@@ -1060,7 +1051,8 @@ def eval_val_sliding_ngram(
    if rank == 0 and bi % 200 == 0:
     running_bpb = ((loss_sum / token_count) / math.log(2.0) * token_count / byte_count).item() if token_count > 0 else 0
     pct = 100.0 * bi / max(len(window_starts), 1)
-    log0(f"  ngram_eval [{bi}/{len(window_starts)}] {pct:.1f}% running_bpb={running_bpb:.6f}")
+    w = mixer._weights()
+    log0(f"  hedge [{bi}/{len(window_starts)}] {pct:.1f}% bpb={running_bpb:.6f} w=[N:{w[0]:.3f} U:{w[1]:.3f} B:{w[2]:.3f} T:{w[3]:.3f} X:{w[4]:.3f}]")
  if dist.is_available() and dist.is_initialized():
   dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
   dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -1592,22 +1584,22 @@ def main() -> None:
   )
   log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
   log0(f"final_int6_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
- ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "0")))
- if ngram_enabled:
-  log0("Starting n-gram cache evaluation...")
+ hedge_enabled = bool(int(os.environ.get("HEDGE_ENABLED", "0")))
+ if hedge_enabled:
+  log0("Starting Hedge Mixer evaluation (5 experts: neural+unigram+bigram+trigram+uniform)...")
   torch.cuda.synchronize()
-  t_ngram = time.perf_counter()
-  ng_val_loss, ng_val_bpb = eval_val_sliding_ngram(
+  t_hedge = time.perf_counter()
+  hm_val_loss, hm_val_bpb = eval_val_hedge_mixer(
    args, eval_model, rank, world_size, device,
    val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
    stride=args.eval_stride if args.eval_stride > 0 else 64,
    batch_seqs=32, log0=log0,
-   ngram_order=int(os.environ.get("NGRAM_ORDER", "7")),
+   hedge_eta=float(os.environ.get("HEDGE_ETA", "0.1")),
   )
   torch.cuda.synchronize()
-  log0(f"final_ngram val_loss:{ng_val_loss:.4f} val_bpb:{ng_val_bpb:.4f} "
-     f"ngram_eval_time:{1000.0 * (time.perf_counter() - t_ngram):.0f}ms")
-  log0(f"final_ngram_exact val_loss:{ng_val_loss:.8f} val_bpb:{ng_val_bpb:.8f}")
+  log0(f"final_hedge val_loss:{hm_val_loss:.4f} val_bpb:{hm_val_bpb:.4f} "
+     f"hedge_eval_time:{1000.0 * (time.perf_counter() - t_hedge):.0f}ms")
+  log0(f"final_hedge_exact val_loss:{hm_val_loss:.8f} val_bpb:{hm_val_bpb:.8f}")
  if distributed:
   dist.destroy_process_group()
 if __name__ == "__main__":
