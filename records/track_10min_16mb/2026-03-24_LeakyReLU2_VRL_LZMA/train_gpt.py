@@ -903,57 +903,104 @@ def eval_val_sliding(
  tokens_per_byte = token_count.item() / byte_count.item()
  base_model.train()
  return val_loss, bits_per_token * tokens_per_byte
-class NgramCache:
- def __init__(self, vocab_size: int, max_order: int = 7):
+class NgramCacheFast:
+ def __init__(self, vocab_size: int, max_order: int = 7, hash_size: int = 65536):
   self.V = vocab_size
   self.max_order = max_order
-  self.counts: list[dict] = [{} for _ in range(max_order + 1)]
-  self.context_counts: list[dict] = [{} for _ in range(max_order + 1)]
+  self.H = hash_size
+  self.unigram = np.zeros(vocab_size, dtype=np.float64)
+  self.bigram = np.zeros((vocab_size, vocab_size), dtype=np.float32)
+  self.bigram_ctx = np.zeros(vocab_size, dtype=np.float32)
+  self.trigram = np.zeros((hash_size, vocab_size), dtype=np.float32)
+  self.trigram_ctx = np.zeros(hash_size, dtype=np.float32)
+  self.higher = [{} for _ in range(max_order - 2)]
+  self.higher_ctx = [{} for _ in range(max_order - 2)]
   self.total = 0
- def update(self, tokens: list[int]) -> None:
-  self.total += len(tokens)
-  for i, tok in enumerate(tokens):
-   self.counts[0][tok] = self.counts[0].get(tok, 0) + 1
-   for n in range(1, self.max_order + 1):
-    if i >= n:
-     ctx = tuple(tokens[i - n:i])
-     if ctx not in self.counts[n]:
-      self.counts[n][ctx] = {}
-      self.context_counts[n][ctx] = 0
-     self.counts[n][ctx][tok] = self.counts[n][ctx].get(tok, 0) + 1
-     self.context_counts[n][ctx] += 1
- def predict(self, context: list[int], neural_log_probs: Tensor) -> Tensor:
-  V = neural_log_probs.shape[-1]
-  neural_probs = torch.softmax(neural_log_probs.float(), dim=-1)
-  neural_entropy = -(neural_probs * torch.log(neural_probs + 1e-10)).sum().item()
-  max_entropy = math.log(V)
-  confidence = 1.0 - min(neural_entropy / max_entropy, 1.0)
-  ngram_probs = None
-  for n in range(self.max_order, 0, -1):
-   if len(context) >= n:
-    ctx = tuple(context[-n:])
-    if ctx in self.counts[n] and self.context_counts[n][ctx] >= 2:
-     dist = self.counts[n][ctx]
-     total = self.context_counts[n][ctx]
-     p = torch.zeros(V, device=neural_log_probs.device)
-     for tok, count in dist.items():
-      if tok < V:
-       p[tok] = count / total
-     if p.sum() > 0:
-      ngram_probs = p
-      break
-  if ngram_probs is None and self.total > 0:
-   p = torch.zeros(V, device=neural_log_probs.device)
-   for tok, count in self.counts[0].items():
-    if tok < V:
-     p[tok] = count / self.total
-   if p.sum() > 0:
-    ngram_probs = p
-  if ngram_probs is None:
-   return neural_log_probs
+  self._PRIME = 1000003
+ def _hash2(self, a: int, b: int) -> int:
+  return ((a * 36313) ^ (b * 27191)) % self.H
+ def _hash_n(self, ctx: tuple) -> int:
+  h = 0
+  for t in ctx:
+   h = (h * self._PRIME + t) % self.H
+  return h
+ def update_batch(self, tokens: np.ndarray) -> None:
+  n = len(tokens)
+  if n == 0:
+   return
+  self.total += n
+  for t in tokens:
+   self.unigram[t] += 1
+  if n >= 2:
+   for i in range(1, n):
+    prev, cur = int(tokens[i-1]), int(tokens[i])
+    self.bigram[prev, cur] += 1
+    self.bigram_ctx[prev] += 1
+  if n >= 3:
+   for i in range(2, n):
+    h = self._hash2(int(tokens[i-2]), int(tokens[i-1]))
+    cur = int(tokens[i])
+    self.trigram[h, cur] += 1
+    self.trigram_ctx[h] += 1
+  for order_idx in range(len(self.higher)):
+   order = order_idx + 4
+   if n >= order:
+    for i in range(order - 1, n):
+     ctx = tuple(int(tokens[j]) for j in range(i - order + 1, i))
+     cur = int(tokens[i])
+     h = self._hash_n(ctx)
+     if h not in self.higher[order_idx]:
+      self.higher[order_idx][h] = {}
+      self.higher_ctx[order_idx][h] = 0
+     self.higher[order_idx][h][cur] = self.higher[order_idx][h].get(cur, 0) + 1
+     self.higher_ctx[order_idx][h] += 1
+ def mix_batch(self, logits: Tensor, targets: Tensor, prev_tokens: Tensor,
+        all_tokens: np.ndarray, positions: list[int], device: torch.device) -> Tensor:
+  bsz = logits.shape[0]
+  neural_probs = torch.softmax(logits.float(), dim=-1)
+  entropy = -(neural_probs * torch.log(neural_probs + 1e-10)).sum(dim=-1)
+  max_ent = math.log(self.V)
+  confidence = 1.0 - torch.clamp(entropy / max_ent, 0, 1)
   alpha = 0.3 * (1.0 - confidence)
-  mixed = (1.0 - alpha) * neural_probs + alpha * ngram_probs
-  return torch.log(mixed + 1e-10)
+  ngram_probs = torch.zeros(bsz, self.V, device=device)
+  matched = torch.zeros(bsz, dtype=torch.bool, device=device)
+  for idx in range(bsz):
+   pos = positions[idx]
+   found = False
+   for order_idx in range(len(self.higher) - 1, -1, -1):
+    order = order_idx + 4
+    if pos >= order:
+     ctx = tuple(int(all_tokens[j]) for j in range(pos - order + 1, pos))
+     h = self._hash_n(ctx)
+     if h in self.higher[order_idx] and self.higher_ctx[order_idx][h] >= 2:
+      dist = self.higher[order_idx][h]
+      total = self.higher_ctx[order_idx][h]
+      for tok, cnt in dist.items():
+       if tok < self.V:
+        ngram_probs[idx, tok] = cnt / total
+      found = True
+      break
+   if not found and pos >= 2:
+    h = self._hash2(int(all_tokens[pos-1]), int(all_tokens[pos]))
+    if self.trigram_ctx[h] >= 2:
+     row = self.trigram[h]
+     total = self.trigram_ctx[h]
+     ngram_probs[idx] = torch.from_numpy(row / total).to(device)
+     found = True
+   if not found and pos >= 1:
+    prev = int(all_tokens[pos])
+    if self.bigram_ctx[prev] >= 2:
+     row = self.bigram[prev]
+     total = self.bigram_ctx[prev]
+     ngram_probs[idx] = torch.from_numpy((row / total).astype(np.float32)).to(device)
+     found = True
+   if not found and self.total > 0:
+    ngram_probs[idx] = torch.from_numpy((self.unigram / self.total).astype(np.float32)).to(device)
+    found = True
+   matched[idx] = found
+  mixed = (1.0 - alpha.unsqueeze(-1)) * neural_probs + alpha.unsqueeze(-1) * ngram_probs
+  nll = -torch.log(mixed[torch.arange(bsz, device=device), targets] + 1e-10)
+  return nll
 def eval_val_sliding_ngram(
  args, base_model: nn.Module, rank: int, world_size: int,
  device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
@@ -964,7 +1011,7 @@ def eval_val_sliding_ngram(
  seq_len = args.train_seq_len
  total_tokens = val_tokens.numel() - 1
  vocab_size = args.vocab_size
- cache = NgramCache(vocab_size, max_order=ngram_order)
+ cache = NgramCacheFast(vocab_size, max_order=ngram_order)
  window_starts = sorted([ws for ws in range(0, total_tokens, stride)
        if min(ws + seq_len, total_tokens) - ws >= 1])
  base_model.eval()
@@ -972,7 +1019,7 @@ def eval_val_sliding_ngram(
  loss_sum = torch.zeros((), device=device, dtype=torch.float64)
  token_count = torch.zeros((), device=device, dtype=torch.float64)
  byte_count = torch.zeros((), device=device, dtype=torch.float64)
- all_tokens = val_tokens.cpu().tolist()
+ all_tokens = val_tokens.cpu().numpy().astype(np.int32)
  scored_up_to = 0
  with torch.inference_mode():
   for bi in range(0, len(window_starts), batch_seqs):
@@ -993,24 +1040,27 @@ def eval_val_sliding_ngram(
    for i, ws in enumerate(batch_ws):
     wlen = wlens[i]
     s = 0 if ws == 0 else max(wlen - stride, 0)
-    for t in range(s, wlen):
-     token_pos = ws + t
-     target_tok = y_batch[i, t].item()
-     prev_tok = x_batch[i, t].item()
-     ctx_start = max(0, token_pos - ngram_order)
-     context = all_tokens[ctx_start:token_pos + 1]
-     mixed_log_probs = cache.predict(context, logits[i, t])
-     nll = -mixed_log_probs[target_tok].to(torch.float64)
-     loss_sum += nll
-     token_count += 1.0
-     tb = base_bytes_lut[target_tok].to(torch.float64)
-     tb += (has_leading_space_lut[target_tok] & ~is_boundary_token_lut[prev_tok]).to(torch.float64)
-     byte_count += tb
-     cache.update(all_tokens[scored_up_to:token_pos + 2])
-     scored_up_to = max(scored_up_to, token_pos + 2)
-   if rank == 0 and bi % 500 == 0:
+    score_len = wlen - s
+    if score_len <= 0:
+     continue
+    scored_logits = logits[i, s:wlen]
+    scored_targets = y_batch[i, s:wlen]
+    scored_prev = x_batch[i, s:wlen]
+    positions = [ws + t for t in range(s, wlen)]
+    new_end = ws + wlen + 1
+    if new_end > scored_up_to:
+     cache.update_batch(all_tokens[scored_up_to:new_end])
+     scored_up_to = new_end
+    nll_batch = cache.mix_batch(scored_logits, scored_targets, scored_prev, all_tokens, positions, device)
+    loss_sum += nll_batch.to(torch.float64).sum()
+    token_count += score_len
+    tb = base_bytes_lut[scored_targets].to(torch.float64)
+    tb += (has_leading_space_lut[scored_targets] & ~is_boundary_token_lut[scored_prev]).to(torch.float64)
+    byte_count += tb.sum()
+   if rank == 0 and bi % 200 == 0:
     running_bpb = ((loss_sum / token_count) / math.log(2.0) * token_count / byte_count).item() if token_count > 0 else 0
-    log0(f"  ngram_eval [{bi}/{len(window_starts)}] running_bpb={running_bpb:.6f}")
+    pct = 100.0 * bi / max(len(window_starts), 1)
+    log0(f"  ngram_eval [{bi}/{len(window_starts)}] {pct:.1f}% running_bpb={running_bpb:.6f}")
  if dist.is_available() and dist.is_initialized():
   dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
   dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
