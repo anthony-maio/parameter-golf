@@ -656,7 +656,7 @@ class ValueEmbedding(nn.Module):
   return h * self.scale.to(dtype=h.dtype)
 def make_seeded_rademacher(rows: int, cols: int, seed: int, device: torch.device, dtype: torch.dtype) -> Tensor:
  idx = torch.arange(rows * cols, device="cpu", dtype=torch.int64).view(rows, cols)
- hashed = ((idx * 2654435761 + seed * 2246822519) >> 16) & 1
+ hashed = ((idx * 48271 + seed * 16807) >> 8) & 1
  m = hashed.to(torch.float32).mul_(2.0).sub_(1.0) / math.sqrt(cols)
  return m.to(device=device, dtype=dtype)
 class RandomMapAdapterProj(nn.Module):
