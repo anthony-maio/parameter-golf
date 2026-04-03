@@ -1,0 +1,13 @@
+{
+    "name": "SLOT_v2_BugFixes",
+    "author": "Anthony Maio",
+    "github_id": "anthony-maio",
+    "date": "2026-04-03",
+    "track": "10min_16mb",
+    "num_gpus": 8,
+    "gpu_type": "H100 SXM",
+    "training_time_seconds": 600,
+    "val_bpb": null,
+    "seed_results": {},
+    "blurb": "v2: Fix RoPE train_seq_len 1024->2048, apply SWA+EMA blend, fix _COMPRESSOR. Same SLOT-16 + QK-Gain 4.0 + XSA-11 stack."
+}
