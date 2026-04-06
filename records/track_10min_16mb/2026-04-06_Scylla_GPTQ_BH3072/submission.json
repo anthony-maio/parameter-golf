@@ -14,5 +14,5 @@
     },
     "mean_val_bpb": 1.0856,
     "std_val_bpb": 0.013,
-    "blurb": "Scylla tokenizer (998 vocab TokenMonster) + AR self-gen GPTQ int6 + BigramHash 3072x112 + VRL + XSA-11 + QK-Gain 4.0 + EMA/SWA + LZMA-9. No SLOT, no TTT. Legally clean."
+    "blurb": "Scylla tokenizer (998 vocab TokenMonster) + AR self-gen GPTQ int6 + BigramHash 3072x112 + VRL + XSA-11 + QK-Gain 4.0 + EMA/SWA + LZMA-9. No SLOT, no TTT. Byte accounting pending revalidation (see PR #1314)."
 }

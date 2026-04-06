@@ -94,11 +94,11 @@ class Hyperparameters:
  ve_dim = int(os.environ.get("VE_DIM", 128))
  ve_layers = os.environ.get("VE_LAYERS", "9,10")
  vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))
- ogd_enabled = bool(int(os.environ.get("OGD_ENABLED", "1")))
+ ogd_enabled = bool(int(os.environ.get("OGD_ENABLED", "0")))
  ogd_lr = float(os.environ.get("OGD_LR", 0.1))
  cache_lambda = float(os.environ.get("CACHE_LAMBDA", 0.02))
  cache_decay = float(os.environ.get("CACHE_DECAY", 0.995))
- ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+ ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
  ttt_lr = float(os.environ.get("TTT_LR", 0.001))
  ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
  ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
@@ -1424,7 +1424,7 @@ def main() -> None:
  quant_buf = io.BytesIO()
  torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
  quant_raw = quant_buf.getvalue()
- quant_blob = lzma.compress(quant_raw, preset=6)
+ quant_blob = lzma.compress(quant_raw, preset=9)
  if master_process:
   with open("final_model.int6.ptz", "wb") as f:
    f.write(quant_blob)
@@ -1475,7 +1475,6 @@ def main() -> None:
   torch.cuda.synchronize()
   log0(f"final_int6_sliding_window val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
   log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-  log0(f"final_int6_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
  if args.eval_stride != 64 and 64 < sw_seq_len:
   torch.cuda.synchronize()
   t_slide64 = time.perf_counter()
@@ -1483,7 +1482,6 @@ def main() -> None:
   torch.cuda.synchronize()
   log0(f"final_int6_sliding_window_s64 val_loss:{sw64_val_loss:.4f} val_bpb:{sw64_val_bpb:.4f} stride:64 eval_time:{1000.0 * (time.perf_counter() - t_slide64):.0f}ms")
   log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-  log0(f"final_int6_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
  if args.ogd_enabled:
   torch._dynamo.reset()
   torch.cuda.synchronize()
