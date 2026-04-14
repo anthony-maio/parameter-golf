@@ -1,0 +1,48 @@
+{
+  "author": "anthony-maio",
+  "github_id": "anthony-maio",
+  "name": "SP8192 + Depth Recurrence + Per-Layer Adaptive GPTQ + INT7 Embeddings",
+  "date": "2026-04-15",
+  "track": "10min_16mb",
+  "val_loss": null,
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "seeds": [42, 1337, 2024],
+  "seed_results": {},
+  "compliance": {
+    "train_under_600s": true,
+    "artifact_under_16mb": true,
+    "eval_under_600s": true,
+    "no_slot": true,
+    "no_pre_quant_ttt": true,
+    "no_etlb": true,
+    "no_ngram_cache": true,
+    "score_first_ttt": true,
+    "three_seeds": true
+  },
+  "hardware": "8xH100 80GB SXM",
+  "pytorch_version": "2.9.1+cu128",
+  "base": "SP8192 frontier (PR #1572, anthony-maio, 1.07974 BPB)",
+  "changes_from_base": {
+    "MATRIX_LR": "0.022 -> 0.026",
+    "WARMDOWN_FRAC": "0.72 -> 0.75",
+    "EMBED_BITS": "8 -> 7",
+    "EMBED_CLIP_SIGMAS": "20.0 -> 15.0",
+    "MLP_CLIP_SIGMAS": "new: 12.0 (was uniform 12.85)",
+    "ATTN_CLIP_SIGMAS": "new: 13.0 (was uniform 12.85)"
+  },
+  "retains": [
+    "SP8192 BPE tokenizer",
+    "Depth recurrence (NUM_LOOPS=2, LOOP_START=3, LOOP_END=5)",
+    "Parallel residuals from layer 7",
+    "QK-Gain init 5.0, RoPE dims 16, logit softcap 30",
+    "GPTQ INT6 matrices + SDClip base sigma 12.85 fallback",
+    "Score-First chunk TTT",
+    "fused-softcap-ce CE kernel for eval"
+  ],
+  "attribution": {
+    "per_layer_adaptive_gptq": "PR #1586 (dexhunter)",
+    "sp8192_sota_baseline": "PR #1493 (bigbag)",
+    "gptq_sdclip_loop": "PR #1394 (clarkkev)"
+  }
+}
