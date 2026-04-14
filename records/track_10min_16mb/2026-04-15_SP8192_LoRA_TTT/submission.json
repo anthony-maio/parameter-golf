@@ -1,0 +1,49 @@
+{
+  "author": "anthony-maio",
+  "github_id": "anthony-maio",
+  "name": "SP8192 + Depth Recurrence + Doc-Independent Batched LoRA TTT",
+  "date": "2026-04-15",
+  "track": "10min_16mb",
+  "val_loss": null,
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "seeds": [42, 1337, 2024],
+  "seed_results": {},
+  "compliance": {
+    "train_under_600s": true,
+    "artifact_under_16mb": true,
+    "eval_under_600s": true,
+    "no_slot": true,
+    "no_pre_quant_ttt": true,
+    "no_etlb": true,
+    "no_ngram_cache": true,
+    "score_first_ttt": true,
+    "three_seeds": true
+  },
+  "hardware": "8xH100 80GB SXM",
+  "pytorch_version": "2.9.1+cu128",
+  "base": "SP8192 frontier (PR #1572, anthony-maio, 1.07974 BPB)",
+  "changes_from_base": {
+    "TTT mechanism": "chunk-based score-first SGD -> batched LoRA (doc-independent)",
+    "TTT_MODE": "new env var, default 'lora'",
+    "TTT_LORA_RANK": "new, default 96",
+    "TTT_LORA_LR": "new, default 0.0001",
+    "TTT_CHUNK_SIZE": "new, default 32",
+    "TTT_BATCH_SIZE": "new, default 64 (docs per LoRA batch)",
+    "TTT_K_LORA / TTT_MLP_LORA / TTT_O_LORA": "new, default 1 (apply LoRA to K, MLP-up, output proj)"
+  },
+  "retains": [
+    "SP8192 BPE tokenizer",
+    "Depth recurrence (NUM_LOOPS=2, LOOP_START=3, LOOP_END=5)",
+    "Parallel residuals from layer 7",
+    "QK-Gain init 5.0, RoPE dims 16, logit softcap 30",
+    "GPTQ INT6 matrices + INT8 embed + SDClip 12.85",
+    "fused-softcap-ce CE kernel for eval",
+    "Training path unchanged (LoRA is eval-only, score-first compliant)"
+  ],
+  "attribution": {
+    "batched_lora_ttt": "PR #1530 (samacqua)",
+    "sp8192_sota_baseline": "PR #1493 (bigbag)",
+    "gptq_sdclip_loop": "PR #1394 (clarkkev)"
+  }
+}
