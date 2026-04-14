@@ -100,6 +100,8 @@ class Hyperparameters:
     matrix_bits = int(os.environ.get('MATRIX_BITS', 6))
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
+    loop_clip_sigmas = float(os.environ.get('LOOP_CLIP_SIGMAS', 10.0))
+    pod_speedgate_ms = float(os.environ.get('POD_SPEEDGATE_MS', 0.0))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     rank = int(os.environ.get('RANK', '0'))
@@ -347,7 +349,7 @@ class CausalSelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
 
-    def forward(self, x, lora_q=None, lora_k=None, lora_v=None, lora_o=None):
+    def forward(self, x, lora_q=None, lora_k=None, lora_v=None):
         bsz, seqlen, dim = x.shape
         q_out = self.c_q(x)
         if lora_q is not None:
@@ -371,10 +373,7 @@ class CausalSelfAttention(nn.Module):
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
-        out = self.proj(y)
-        if lora_o is not None:
-            out = out + lora_o(y)
-        return out
+        return self.proj(y)
 
 class BatchedLinearLoRA(nn.Module):
 
@@ -410,7 +409,7 @@ class BatchedTTTLoRA(nn.Module):
         self.q_loras = nn.ModuleList([BatchedLinearLoRA(bsz, dim, dim, rank) for _ in range(num_slots)])
         self.v_loras = nn.ModuleList([BatchedLinearLoRA(bsz, dim, kv_dim, rank) for _ in range(num_slots)])
         self.k_loras = nn.ModuleList([BatchedLinearLoRA(bsz, dim, kv_dim, rank) for _ in range(num_slots)]) if k_lora else None
-        self.mlp_loras = nn.ModuleList([BatchedLinearLoRA(bsz, dim, int(model.blocks[0].mlp.fc.weight.shape[0]), rank) for _ in range(num_slots)]) if mlp_lora else None
+        self.mlp_loras = nn.ModuleList([BatchedLinearLoRA(bsz, dim, dim, rank) for _ in range(num_slots)]) if mlp_lora else None
         self.o_loras = nn.ModuleList([BatchedLinearLoRA(bsz, dim, dim, rank) for _ in range(num_slots)]) if o_lora else None
 
     def reset(self):
@@ -431,11 +430,8 @@ class MLP(nn.Module):
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
-    def forward(self, x, lora_up=None):
-        h = self.fc(x)
-        if lora_up is not None:
-            h = h + lora_up(x)
-        return self.proj(F.leaky_relu(h, negative_slope=0.5).square())
+    def forward(self, x):
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class Block(nn.Module):
 
@@ -451,17 +447,26 @@ class Block(nn.Module):
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.parallel = False
 
-    def forward(self, x, x0, lora_q=None, lora_k=None, lora_v=None, lora_o=None, lora_up=None):
+    def forward(self, x, x0, lora_q=None, lora_k=None, lora_v=None, lora_o=None, lora_mlp=None):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor,
-                             lora_q=lora_q, lora_k=lora_k, lora_v=lora_v, lora_o=lora_o)
+        n = self.attn_norm(x_in) * self.ln_scale_factor
+        attn_out = self.attn(n, lora_q=lora_q, lora_k=lora_k, lora_v=lora_v)
+        if lora_o is not None:
+            attn_out = attn_out + lora_o(n)
         if self.parallel:
-            mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor, lora_up=lora_up)
+            mlp_n = self.mlp_norm(x_in) * self.ln_scale_factor
+            mlp_out = self.mlp(mlp_n)
+            if lora_mlp is not None:
+                mlp_out = mlp_out + lora_mlp(mlp_n)
             x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
         else:
             x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, lora_up=lora_up)
+            mlp_n = self.mlp_norm(x_out) * self.ln_scale_factor
+            mlp_out = self.mlp(mlp_n)
+            if lora_mlp is not None:
+                mlp_out = mlp_out + lora_mlp(mlp_n)
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * mlp_out
         return x_out
 
 class GPT(nn.Module):
@@ -578,7 +583,7 @@ class GPT(nn.Module):
                                lora_k=_lora_at(lora.k_loras, slot),
                                lora_v=_lora_at(lora.v_loras, slot),
                                lora_o=_lora_at(lora.o_loras, slot),
-                               lora_up=_lora_at(lora.mlp_loras, slot))
+                               lora_mlp=_lora_at(lora.mlp_loras, slot))
             slot += 1
             skips.append(x)
         for skip_idx, i in enumerate(dec_iter):
@@ -594,7 +599,7 @@ class GPT(nn.Module):
                                lora_k=_lora_at(lora.k_loras, slot),
                                lora_v=_lora_at(lora.v_loras, slot),
                                lora_o=_lora_at(lora.o_loras, slot),
-                               lora_up=_lora_at(lora.mlp_loras, slot))
+                               lora_mlp=_lora_at(lora.mlp_loras, slot))
             slot += 1
         x = self.final_norm(x)
         if self.head_proj is not None:
@@ -820,7 +825,16 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = 'passthrough (float16)'
             continue
-        cs = h.embed_clip_sigmas if 'tok_emb' in name else h.matrix_clip_sigmas
+        if 'tok_emb' in name:
+            cs = h.embed_clip_sigmas
+        else:
+            cs = h.matrix_clip_sigmas
+            if h.num_loops > 0:
+                m = re.search(r'blocks\.(\d+)\.', name)
+                if m:
+                    layer_idx = int(m.group(1))
+                    if h.loop_start <= layer_idx <= h.loop_end:
+                        cs = h.loop_clip_sigmas
         bits = h.embed_bits if 'tok_emb' in name else h.matrix_bits
         q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
         result[name + '.q'] = q
@@ -1453,6 +1467,12 @@ def train_model(h, device, val_data):
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1000.0)
             log(f'{step}/{h.iterations} train_loss: {train_loss.item():.4f} train_time: {approx_training_time_ms / 60000:.1f}m tok/s: {tok_per_sec:.0f}')
+        if h.pod_speedgate_ms > 0 and step == 20:
+            ms_per_step = approx_training_time_ms / step
+            log(f'pod_speedgate: step 20 ms/step={ms_per_step:.1f} threshold={h.pod_speedgate_ms:.1f}')
+            if ms_per_step > h.pod_speedgate_ms:
+                log(f'pod_speedgate: ABORTING -- pod too slow, kill and retry')
+                raise RuntimeError(f'pod_speedgate failed: {ms_per_step:.1f}ms/step > {h.pod_speedgate_ms:.1f}ms threshold')
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if h.distributed and max_wallclock_ms is not None:
             reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
