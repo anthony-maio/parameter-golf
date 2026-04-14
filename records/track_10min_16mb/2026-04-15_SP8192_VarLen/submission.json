@@ -1,0 +1,46 @@
+{
+  "author": "anthony-maio",
+  "github_id": "anthony-maio",
+  "name": "SP8192 + Depth Recurrence + VarLen Attention + Fused MLP + Score-First TTT",
+  "date": "2026-04-15",
+  "track": "10min_16mb",
+  "val_loss": null,
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "seeds": [42, 1337, 2024],
+  "seed_results": {},
+  "compliance": {
+    "train_under_600s": true,
+    "artifact_under_16mb": true,
+    "eval_under_600s": true,
+    "no_slot": true,
+    "no_pre_quant_ttt": true,
+    "no_etlb": true,
+    "no_ngram_cache": true,
+    "score_first_ttt": true,
+    "three_seeds": true
+  },
+  "hardware": "8xH100 80GB SXM",
+  "pytorch_version": "2.9.1+cu128",
+  "base": "PR #1493 (bigbag, merged SOTA) + fused-softcap-ce (anthony-maio)",
+  "adds": [
+    "flash_attn_varlen_func with document-packed cu_seqlens",
+    "Fused Triton kernel for linear + LeakyReLU(0.5)^2 MLP up-projection",
+    "DocumentPackingLoader replacing per-sequence shuffling for training"
+  ],
+  "retains": [
+    "SP8192 BPE tokenizer",
+    "Depth recurrence (NUM_LOOPS=2, LOOP_START=3, LOOP_END=5)",
+    "Parallel residuals from layer 7",
+    "QK-Gain init 5.0, RoPE dims 16, logit softcap 30",
+    "GPTQ INT6 weights + INT8 embeddings + SDClip 12.85 sigma",
+    "Score-First chunk TTT",
+    "fused-softcap-ce CE kernel for eval"
+  ],
+  "attribution": {
+    "varlen_attention": "PR #1530 (samacqua)",
+    "fused_mlp_kernel": "PR #1530 (samacqua), based on modded-nanogpt triton kernels",
+    "sp8192_sota_baseline": "PR #1493 (bigbag)",
+    "gptq_sdclip_loop": "PR #1394 (clarkkev)"
+  }
+}
