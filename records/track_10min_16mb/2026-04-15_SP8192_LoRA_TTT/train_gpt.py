@@ -1496,8 +1496,10 @@ def train_and_eval(h, device):
         if h.num_loops > 0:
             ttt_model.looping_active = True
         if h.ttt_mode == 'lora':
-            fwd_ttt_compiled = torch.compile(ttt_model.forward_ttt, dynamic=False, fullgraph=True)
-            timed_eval('quantized_ttt', ttt_lora_evaluate, h, ttt_model, device, val_data, fwd_ttt_compiled)
+            fwd_ttt_fn = ttt_model.forward_ttt
+            if bool(int(os.environ.get('TTT_COMPILE', '0'))):
+                fwd_ttt_fn = torch.compile(ttt_model.forward_ttt, dynamic=True, fullgraph=False)
+            timed_eval('quantized_ttt', ttt_lora_evaluate, h, ttt_model, device, val_data, fwd_ttt_fn)
         else:
             timed_eval('quantized_ttt', eval_val_ttt, h, device, val_data, ttt_model)
         del ttt_model
