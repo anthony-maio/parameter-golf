@@ -41,8 +41,10 @@ if ! python -c "from flash_attn_interface import flash_attn_varlen_func" 2>/dev/
     pip install --break-system-packages "flash_attn_3" \
         --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291 2>&1 | tail -5
 fi
-# Same defensive install for record-dir requirements (mostly no-ops on official template)
-pip install --break-system-packages -r $RECORD_DIR/requirements.txt 2>&1 | tail -3 || true
+# Always install record-dir requirements unconditionally -- official template
+# lacks python-minifier (provides pyminify CLI used by the artifact serializer)
+# and missing it doesn't surface until the very end of training.
+pip install --break-system-packages -r $RECORD_DIR/requirements.txt 2>&1 | tail -5
 python -c "
 import torch
 print('torch:', torch.__version__)
