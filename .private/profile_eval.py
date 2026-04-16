@@ -100,23 +100,32 @@ def main():
     torch.cuda.synchronize()
     print(f"  sanity loss: {loss.item():.4f}")
 
-    total_iters = args.warmup + args.active
-    print(f"Profiling {total_iters} iterations ({args.warmup} warmup + {args.active} active)...")
+    # Extra warmup outside profiler window so compile/allocator settles.
+    print(f"Extra warmup: {args.warmup} iters")
+    for _ in range(args.warmup):
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = base_model.forward_logits(x)
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, h.vocab_size),
+                y.reshape(-1),
+            )
+    torch.cuda.synchronize()
+
+    # Raw profile window -- no schedule (schedule was swallowing kernel events).
+    print(f"Profiling {args.active} active iterations...")
     with profiler.profile(
         activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
-        schedule=profiler.schedule(wait=0, warmup=args.warmup, active=args.active),
         record_shapes=False,
         with_stack=False,
     ) as prof:
-        for i in range(total_iters):
+        for i in range(args.active):
             with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = base_model.forward_logits(x)
                 loss = F.cross_entropy(
                     logits.float().reshape(-1, h.vocab_size),
                     y.reshape(-1),
                 )
-            torch.cuda.synchronize()
-            prof.step()
+        torch.cuda.synchronize()
 
     table_self = prof.key_averages().table(
         sort_by="self_cuda_time_total",
