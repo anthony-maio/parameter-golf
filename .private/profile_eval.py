@@ -134,7 +134,9 @@ def main():
     total_cuda_us = 0
     for e in prof.key_averages():
         name = e.key
-        self_cuda = getattr(e, "self_cuda_time_total", None) or getattr(e, "self_device_time_total", 0)
+        self_cuda = getattr(e, "self_device_time_total", None)
+        if self_cuda is None:
+            self_cuda = getattr(e, "self_cuda_time_total", 0)
         total_cuda_us += self_cuda
         if any(s in name for s in CE_SUBSTR):
             ce_time_us += self_cuda
