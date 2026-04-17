@@ -563,6 +563,33 @@ def train_and_eval(h,device):
 		del eval_model,compiled_model;torch._dynamo.reset();torch.cuda.empty_cache();ttt_model=deserialize(h,device)
 		if h.num_loops>0:ttt_model.looping_active=True
 		timed_eval('quantized_ttt',eval_val_ttt,h,device,val_data,ttt_model);del ttt_model
+		sweep_spec=os.environ.get('TTT_SWEEP_CONFIGS','')
+		if sweep_spec:
+			_run_sweep=timed_eval
+			for config_str in sweep_spec.split('|'):
+				config_str=config_str.strip()
+				if not config_str:continue
+				if ':' in config_str:name,kv_str=config_str.split(':',1)
+				else:name,kv_str=config_str,''
+				for kv in kv_str.split(';'):
+					if not kv.strip():continue
+					k,v=kv.split('=',1);attr=k.strip().lower()
+					if not hasattr(Hyperparameters,attr):
+						if h.is_main_process:log(f"sweep:WARN unknown attr {attr}")
+						continue
+					current=getattr(Hyperparameters,attr)
+					if isinstance(current,bool):coerced=bool(int(v))
+					elif isinstance(current,int):coerced=int(v)
+					elif isinstance(current,float):coerced=float(v)
+					else:coerced=v.strip()
+					setattr(Hyperparameters,attr,coerced)
+				if h.is_main_process:log(f"sweep:apply name={name} overrides={kv_str}")
+				torch._dynamo.reset();torch.cuda.empty_cache()
+				if h.distributed:dist.barrier()
+				ttt_model=deserialize(h,device)
+				if h.num_loops>0:ttt_model.looping_active=True
+				_run_sweep(f'sweep_{name}',eval_val_ttt,h,device,val_data,ttt_model);del ttt_model
+				torch._dynamo.reset();torch.cuda.empty_cache()
 	if h.etlb_enabled and h.sliding_window_enabled:
 		if'eval_model'not in dir():
 			eval_model=deserialize(h,device)
