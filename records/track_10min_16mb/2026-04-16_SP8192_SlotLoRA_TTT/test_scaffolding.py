@@ -56,7 +56,7 @@ def _stub_modules():
 def _import_train_module():
     spec = importlib.util.spec_from_file_location(
         'train_gpt_readable',
-        os.path.join(os.path.dirname(__file__), '..', 'sp8192_sota_readable.py'),
+        os.path.join(os.path.dirname(__file__), 'train_gpt_sota.py'),
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

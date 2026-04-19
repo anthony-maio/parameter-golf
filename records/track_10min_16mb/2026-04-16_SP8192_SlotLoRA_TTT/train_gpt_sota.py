@@ -438,6 +438,19 @@ def eval_val_ttt(h,device,val_data,base_model,batch_seqs=32):
 	num_params=sum(p.numel()for p in ttt_params);log(f"ttt:start chunks={num_chunks} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs} mode={mode} layer_ids={layer_ids} include_global={int(h.ttt_include_global)} lora_enabled={int(h.ttt_lora_enabled)} lora_rank={h.ttt_lora_rank if h.ttt_lora_enabled else 0} lora_slots={lora_slot_ids} ttt_param_count={num_params} compile={int(use_compile)}")
 	loss_sum=torch.zeros((),device=device,dtype=torch.float64);token_count=torch.zeros((),device=device,dtype=torch.float64);byte_count=torch.zeros((),device=device,dtype=torch.float64)
 	optimizer=torch.optim.SGD(ttt_params,lr=h.ttt_lr,momentum=h.ttt_momentum)if len(ttt_params)>0 else None
+	if bank is not None:
+		with torch.no_grad():
+			_diag_x=torch.zeros(2,seq_len,dtype=torch.int64,device=device);_diag_x[0,:16]=torch.arange(16,device=device)
+			_prev_bsz=base_model.ttt_lora_bsz;base_model.ttt_lora_bsz=0
+			with torch.autocast(device_type='cuda',dtype=torch.bfloat16):_logits_nolora=base_model.forward_logits(_diag_x).float().clone()
+			base_model.ttt_lora_bsz=2
+			with torch.autocast(device_type='cuda',dtype=torch.bfloat16):_logits_b0=base_model.forward_logits(_diag_x).float()
+			_diff=(_logits_nolora-_logits_b0).abs().max().item();_ref=_logits_nolora.abs().max().item()
+			base_model.ttt_lora_bsz=_prev_bsz
+		_b_norm=sum(float(getattr(bank,f'B_{p}').norm().item())for p in bank.proj_set if getattr(bank,f'B_{p}',None)is not None)
+		_a_norm=sum(float(getattr(bank,f'A_{p}').norm().item())for p in bank.proj_set if getattr(bank,f'A_{p}',None)is not None)
+		log(f"ttt:init_check max_abs_diff={_diff:.3e} ref_max={_ref:.3e} bank_A_norm={_a_norm:.3e} bank_B_norm={_b_norm:.3e}")
+		if _diff>1e-2*max(_ref,1.):log(f"ttt:WARN init diff large -- B=0 should give delta=0; forward path may diverge eager-vs-compile or bf16-accumulator-vs-fp32")
 	phase_log=h.ttt_phase_log;score_evs=[];fwd_evs=[];bwd_evs=[];red_evs=[];opt_evs=[]
 	def _evt():e=torch.cuda.Event(enable_timing=True);e.record();return e
 	for ci in range(num_chunks):
@@ -566,11 +579,13 @@ def train_and_eval(h,device):
 		sweep_spec=os.environ.get('TTT_SWEEP_CONFIGS','')
 		if sweep_spec:
 			_run_sweep=timed_eval
+			_sweep_baseline={k:v for(k,v)in vars(Hyperparameters).items()if not k.startswith('_')and not callable(v)}
 			for config_str in sweep_spec.split('|'):
 				config_str=config_str.strip()
 				if not config_str:continue
 				if ':' in config_str:name,kv_str=config_str.split(':',1)
 				else:name,kv_str=config_str,''
+				for(_sk,_sv)in _sweep_baseline.items():setattr(Hyperparameters,_sk,_sv)
 				for kv in kv_str.split(';'):
 					if not kv.strip():continue
 					k,v=kv.split('=',1);attr=k.strip().lower()
@@ -583,7 +598,7 @@ def train_and_eval(h,device):
 					elif isinstance(current,float):coerced=float(v)
 					else:coerced=v.strip()
 					setattr(Hyperparameters,attr,coerced)
-				if h.is_main_process:log(f"sweep:apply name={name} overrides={kv_str}")
+				if h.is_main_process:log(f"sweep:apply name={name} overrides={kv_str} reset_baseline=1")
 				torch._dynamo.reset();torch.cuda.empty_cache()
 				if h.distributed:dist.barrier()
 				ttt_model=deserialize(h,device)
